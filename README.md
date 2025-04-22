@@ -125,5 +125,9 @@ This will update the task with the specified ID to `completed`.
 - `created_at`: Timestamp when the task was created.
 - `updated_at`: Timestamp when the task was last updated.
 
-
+### Run  Tests
+To run the tests with detailed output, use the following command:
+```bash
+pytest --tb=short -v test_task_manager.py
+```
 

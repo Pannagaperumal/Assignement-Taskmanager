@@ -1,15 +1,11 @@
 """task_manager_api.py
-Improved FastAPI application for managing simulated Unix-style tasks.
+FastAPI application for managing simulated Unix‑style tasks with robust edge‑case handling **(simplified – no explicit *fail* endpoint)**.
 
-Changes & highlights:
-- **PEP 8 compliant** imports and naming.
-- **Enum** for task status (running/completed/failed).
-- Removed duplicate route definitions.
-- Added detailed **docstrings**, **comments**, and **type hints** throughout.
-- All database access uses **dependency injection** (`Depends(get_db)`).
-- Routes sorted logically and include `summary` metadata for better auto‑generated docs.
-- Ensured the PID generated is unique without race conditions within the same process.
-- Added ordering by creation date when listing tasks.
+Changes in **v1.3.0**:
+- **Removed** `/tasks/{id}/fail` endpoint and all related logic/fields.
+- `TaskStatus` now only includes `running` and `completed`.
+- Dropped `failure_reason` column from the database schema.
+- Updated docs, examples, and idempotency checks accordingly.
 
 Run with:
 ```bash
@@ -24,9 +20,11 @@ import random
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Path, Query
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, Integer, String, create_engine
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -51,7 +49,6 @@ class TaskStatus(str, enum.Enum):
 
     running = "running"
     completed = "completed"
-    failed = "failed"
 
 
 class Task(Base):
@@ -69,7 +66,7 @@ class Task(Base):
     updated_at: datetime | None = Column(DateTime, nullable=True)
 
 
-# Create DB schema (in production use migrations instead)
+# Create DB schema (in production prefer migrations)
 Base.metadata.create_all(bind=engine)
 
 
@@ -77,7 +74,7 @@ Base.metadata.create_all(bind=engine)
 # Pydantic schemas (request/response bodies)
 # ---------------------------------------------------------------------------
 class TaskCreate(BaseModel):
-    """Schema for creating a new task."""
+    """Request body for creating a new task."""
 
     name: str = Field(..., example="Daily backup")
     priority: int = Field(
@@ -92,7 +89,7 @@ class TaskCreate(BaseModel):
 
 
 class TaskOut(BaseModel):
-    """Schema for returning tasks to clients."""
+    """Response body for exposing tasks."""
 
     id: int
     name: str
@@ -118,10 +115,23 @@ app = FastAPI(
         "* **List / filter** tasks (`GET /tasks`)\n"
         "* **Mark** tasks as completed (`PATCH /tasks/{id}`)"
     ),
-    version="1.1.0",
+    version="1.3.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+# ---------------------------------------------------------------------------
+# Global error handlers
+# ---------------------------------------------------------------------------
+@app.exception_handler(SQLAlchemyError)
+async def db_exception_handler(_: Request, exc: SQLAlchemyError):
+    """Return JSON 500 response for any unhandled SQLAlchemy errors."""
+
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Database error", "error": str(exc)},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +149,29 @@ def get_db() -> Session:
 
 
 # ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+PID_MIN, PID_MAX = 1000, 99999
+
+
+def _generate_unique_pid(db: Session, max_attempts: int = 5) -> int:
+    """Generate a PID that does not collide with existing DB rows.
+
+    Raises:
+        HTTPException 500 if uniqueness cannot be guaranteed after *max_attempts*.
+    """
+
+    for _ in range(max_attempts):
+        pid = random.randint(PID_MIN, PID_MAX)
+        if db.query(Task).filter(Task.id == pid).first() is None:
+            return pid
+    raise HTTPException(
+        status_code=500,
+        detail="Unable to allocate unique PID – try again later.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.get(
@@ -149,7 +182,7 @@ def get_db() -> Session:
 )
 def list_tasks(
     status: Optional[TaskStatus] = Query(
-        None, description="Filter tasks by status (running/completed/failed)"
+        None, description="Filter tasks by status (running/completed)"
     ),
     db: Session = Depends(get_db),
 ):
@@ -169,12 +202,9 @@ def list_tasks(
     summary="Create a new task",
 )
 def create_task(task: TaskCreate, db: Session = Depends(get_db)):
-    """Insert a new task and return the persisted record."""
+    """Insert a new task and return the persisted record with a unique PID."""
 
-    # Generate a unique Unix‑style PID (1000–99999).
-    pid = random.randint(1000, 99999)
-    while db.query(Task).filter(Task.id == pid).first() is not None:
-        pid = random.randint(1000, 99999)
+    pid = _generate_unique_pid(db)
 
     new_task = Task(
         id=pid,
@@ -185,8 +215,13 @@ def create_task(task: TaskCreate, db: Session = Depends(get_db)):
         status=TaskStatus.running.value,
     )
 
-    db.add(new_task)
-    db.commit()
+    try:
+        db.add(new_task)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return create_task(task, db)  # rare collision retry
+
     db.refresh(new_task)
     return new_task
 
@@ -201,11 +236,17 @@ def complete_task(
     task_id: int = Path(..., description="PID of the task to complete"),
     db: Session = Depends(get_db),
 ):
-    """Set a task's *status* to `completed`."""
+    """Set a task's *status* to `completed`.
+
+    Returns **409 Conflict** if the task is already completed.
+    """
 
     task = db.query(Task).filter(Task.id == task_id).first()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status == TaskStatus.completed.value:
+        raise HTTPException(status_code=409, detail="Task already completed")
 
     task.status = TaskStatus.completed.value
     task.updated_at = datetime.utcnow()
